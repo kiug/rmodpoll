@@ -272,8 +272,7 @@ pub fn encode_write_words(
     let mut out = Vec::new();
     for s in values {
         match dt {
-            DataType::HoldingReg16 => out.push(parse_u16(s)?),
-            DataType::HoldingRegHex => out.push(parse_hex_u16(s)?),
+            DataType::HoldingReg16 | DataType::HoldingRegHex => out.push(parse_u16(s)?),
             DataType::HoldingRegI32 => push_u32_words(&mut out, parse_u32(s)?, opts.big_endian_int),
             DataType::HoldingRegI64 => push_u64_words(&mut out, parse_u64(s)?, opts.big_endian_int),
             DataType::HoldingRegMod => push_mod_words(&mut out, parse_u32(s)?),
@@ -418,11 +417,6 @@ fn parse_u16(s: &str) -> Result<u16> {
     }
 }
 
-fn parse_hex_u16(s: &str) -> Result<u16> {
-    let h = strip_hex_prefix(s).unwrap_or(s);
-    u16::from_str_radix(h, 16).map_err(|_| anyhow!("invalid hex value '{s}'"))
-}
-
 fn parse_u32(s: &str) -> Result<u32> {
     if let Some(h) = strip_hex_prefix(s) {
         u32::from_str_radix(h, 16).map_err(|_| anyhow!("invalid hex value '{s}'"))
@@ -479,6 +473,19 @@ mod tests {
         let opts = ValueOptions::default();
         let values = format_registers(&[0x12AB], DataType::HoldingRegHex, &opts).unwrap();
         assert_eq!(values, vec!["0x12AB".to_string()]);
+    }
+
+    #[test]
+    fn hex_write_parses_decimal() {
+        // `modpoll` parses `4:hex` write values as decimal (the `:hex` suffix
+        // only affects display), with an optional `0x` hex prefix.
+        let opts = ValueOptions::default();
+        let words =
+            encode_write_words(DataType::HoldingRegHex, &["1234".to_string()], &opts).unwrap();
+        assert_eq!(words, vec![1234]); // 0x04D2
+        let words =
+            encode_write_words(DataType::HoldingRegHex, &["0x1234".to_string()], &opts).unwrap();
+        assert_eq!(words, vec![0x1234]);
     }
 
     #[test]
