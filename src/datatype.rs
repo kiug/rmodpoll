@@ -224,12 +224,10 @@ fn format_one(words: &[u16], dt: DataType, opts: &ValueOptions) -> String {
             }
         }
         DataType::InputRegMod | DataType::HoldingRegMod => {
-            // Two base-10000 "digits" combined into a 32-bit value.
-            let v = if opts.big_endian_int {
-                u32::from(words[0]) * 10_000 + u32::from(words[1])
-            } else {
-                u32::from(words[1]) * 10_000 + u32::from(words[0])
-            };
+            // Two base-10000 "digits" combined into a 32-bit value. As in
+            // `modpoll`, the first register holds the most significant digit
+            // and the order is fixed (not affected by -i).
+            let v = u32::from(words[0]) * 10_000 + u32::from(words[1]);
             format!("{v}")
         }
         DataType::InputRegF32 | DataType::HoldingRegF32 => {
@@ -278,7 +276,7 @@ pub fn encode_write_words(
             DataType::HoldingRegHex => out.push(parse_hex_u16(s)?),
             DataType::HoldingRegI32 => push_u32_words(&mut out, parse_u32(s)?, opts.big_endian_int),
             DataType::HoldingRegI64 => push_u64_words(&mut out, parse_u64(s)?, opts.big_endian_int),
-            DataType::HoldingRegMod => push_mod_words(&mut out, parse_u32(s)?, opts.big_endian_int),
+            DataType::HoldingRegMod => push_mod_words(&mut out, parse_u32(s)?),
             DataType::HoldingRegF32 => push_f32_words(
                 &mut out,
                 s.parse::<f32>()
@@ -362,16 +360,10 @@ fn push_u64_words(out: &mut Vec<u16>, v: u64, big_endian: bool) {
     }
 }
 
-fn push_mod_words(out: &mut Vec<u16>, v: u32, big_endian: bool) {
-    let hi = (v / 10_000) as u16;
-    let lo = (v % 10_000) as u16;
-    if big_endian {
-        out.push(hi);
-        out.push(lo);
-    } else {
-        out.push(lo);
-        out.push(hi);
-    }
+fn push_mod_words(out: &mut Vec<u16>, v: u32) {
+    // Most significant base-10000 digit first, matching `modpoll`.
+    out.push((v / 10_000) as u16);
+    out.push((v % 10_000) as u16);
 }
 
 fn push_f32_words(out: &mut Vec<u16>, f: f32, big_endian: bool) {
@@ -535,13 +527,24 @@ mod tests {
     }
 
     #[test]
-    fn mod_round_trip() {
+    fn mod_word_order() {
+        // `modpoll` stores the most significant base-10000 digit in the first
+        // register, and this order is fixed (not affected by -i).
         let opts = ValueOptions::default();
         let words =
             encode_write_words(DataType::HoldingRegMod, &["12345678".to_string()], &opts).unwrap();
+        assert_eq!(words, vec![1234, 5678]);
         assert_eq!(
-            format_registers(&words, DataType::HoldingRegMod, &opts).unwrap(),
+            format_registers(&[1234, 5678], DataType::HoldingRegMod, &opts).unwrap(),
             vec!["12345678".to_string()]
         );
+
+        let big = ValueOptions {
+            big_endian_int: true,
+            ..ValueOptions::default()
+        };
+        let words =
+            encode_write_words(DataType::HoldingRegMod, &["12345678".to_string()], &big).unwrap();
+        assert_eq!(words, vec![1234, 5678]);
     }
 }
