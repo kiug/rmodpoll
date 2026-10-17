@@ -6,9 +6,14 @@
 //! RTU codec attached to a `TcpStream` (`tokio_modbus::client::rtu::attach_slave`).
 
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::time::Sleep;
+use tokio_serial::SerialPort;
 
 use tokio_modbus::Error;
 use tokio_modbus::bytes::Bytes;
@@ -288,18 +293,112 @@ impl SlaveContext for UdpClient {
 }
 
 // ---------------------------------------------------------------------------
+// RS-485 aware serial transport
+// ---------------------------------------------------------------------------
+
+enum FlushState {
+    Idle,
+    Flushing,
+    Waiting(Pin<Box<Sleep>>),
+}
+
+/// Wraps a serial stream and, when an RTS delay is configured, asserts RTS
+/// before writing and deasserts it after the data has been flushed plus the
+/// requested delay. This is the classic half-duplex RS-485 turnaround control.
+pub struct RtsStream {
+    inner: tokio_serial::SerialStream,
+    delay: Option<Duration>,
+    state: FlushState,
+}
+
+impl RtsStream {
+    pub fn new(inner: tokio_serial::SerialStream, delay: Option<Duration>) -> Self {
+        Self {
+            inner,
+            delay,
+            state: FlushState::Idle,
+        }
+    }
+}
+
+impl AsyncRead for RtsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for RtsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.delay.is_some() {
+            this.inner
+                .write_request_to_send(true)
+                .map_err(io::Error::other)?;
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.delay.is_none() {
+            return Pin::new(&mut this.inner).poll_flush(cx);
+        }
+
+        loop {
+            match std::mem::replace(&mut this.state, FlushState::Idle) {
+                FlushState::Idle => {
+                    this.state = FlushState::Flushing;
+                }
+                FlushState::Flushing => {
+                    ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+                    let sleep = Box::pin(tokio::time::sleep(this.delay.unwrap()));
+                    this.state = FlushState::Waiting(sleep);
+                }
+                FlushState::Waiting(mut sleep) => {
+                    if sleep.as_mut().poll(cx).is_pending() {
+                        this.state = FlushState::Waiting(sleep);
+                        return Poll::Pending;
+                    }
+                    this.inner
+                        .write_request_to_send(false)
+                        .map_err(io::Error::other)?;
+                    this.state = FlushState::Idle;
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.delay.is_some() {
+            let _ = this.inner.write_request_to_send(false);
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Modbus ASCII client
 // ---------------------------------------------------------------------------
 
 /// A Modbus ASCII client. The PDU is framed with `:` / CRLF and an LRC checksum
 /// and encoded as hexadecimal characters over a serial line.
 pub struct AsciiClient {
-    port: tokio_serial::SerialStream,
+    port: RtsStream,
     slave: Slave,
 }
 
 impl AsciiClient {
-    pub fn new(port: tokio_serial::SerialStream, slave: Slave) -> Self {
+    pub fn new(port: RtsStream, slave: Slave) -> Self {
         Self { port, slave }
     }
 }

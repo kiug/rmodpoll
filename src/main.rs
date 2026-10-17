@@ -13,7 +13,7 @@ use tokio_modbus::prelude::{
 };
 
 use crate::datatype::{DataType, ValueOptions, encode_write_words, format_registers, parse_bits};
-use crate::transport::{AsciiClient, UdpClient, push_u16};
+use crate::transport::{AsciiClient, RtsStream, UdpClient, push_u16};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Protocol {
@@ -121,7 +121,7 @@ struct Cli {
     #[arg(short = 's', value_name = "BITS", default_value_t = 1)]
     stop_bits: u8,
 
-    /// RS-485 mode: assert RTS while transmitting + N ms after
+    /// RS-485 mode: RTS on while transmitting and N ms after
     #[arg(short = '4', value_name = "MS")]
     rts_delay_ms: Option<u32>,
 }
@@ -235,6 +235,10 @@ impl Config {
             bail!("stop bits must be 1 or 2");
         }
 
+        if cli.rts_delay_ms.is_some() && !protocol.is_serial() {
+            bail!("RS-485 mode (-4) is only valid with Modbus ASCII or RTU");
+        }
+
         if !cli.write_values.is_empty() && !data_type.is_writable() {
             bail!("data type {} cannot be written", data_type.describe());
         }
@@ -336,7 +340,7 @@ fn print_header(cfg: &Config) {
     );
 
     if let Some(ms) = cfg.rts_delay_ms {
-        println!("RS-485 mode: RTS asserted (+{ms} ms)");
+        println!("RS-485 mode: RTS during transmit +{ms} ms after");
     }
 
     println!();
@@ -386,11 +390,7 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("could not resolve host '{host}'"))
 }
 
-fn open_serial(
-    path: &str,
-    cfg: &Config,
-    default_data_bits: u8,
-) -> Result<tokio_serial::SerialStream> {
+fn open_serial(path: &str, cfg: &Config, default_data_bits: u8) -> Result<RtsStream> {
     use tokio_serial::{DataBits, FlowControl, Parity, SerialStream, StopBits};
 
     let data_bits = match cfg.data_bits.unwrap_or(default_data_bits) {
@@ -415,16 +415,11 @@ fn open_serial(
         .parity(parity)
         .flow_control(FlowControl::None);
 
-    let mut port = SerialStream::open(&builder)?;
-
-    // RS-485 mode: keep RTS asserted so that half-duplex transceivers stay in
-    // transmit mode. (A full transmit-gated RTS toggle is not implemented.)
-    if cfg.rts_delay_ms.is_some() {
-        use tokio_serial::SerialPort as _;
-        port.write_request_to_send(true)?;
-    }
-
-    Ok(port)
+    let port = SerialStream::open(&builder)?;
+    let rts_delay = cfg
+        .rts_delay_ms
+        .map(|ms| Duration::from_millis(u64::from(ms)));
+    Ok(RtsStream::new(port, rts_delay))
 }
 
 /// Wraps a Modbus operation with the configured timeout and flattens the
