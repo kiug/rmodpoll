@@ -93,10 +93,6 @@ struct Cli {
     #[arg(short = 'e')]
     enron: bool,
 
-    /// Lufkin ELAM extensions (RTU and RTU-over-TCP only)
-    #[arg(short = 'x')]
-    lufkin: bool,
-
     /// First reference is 0 (PDU addressing) instead of 1
     #[arg(short = '0')]
     zero_based: bool,
@@ -145,7 +141,6 @@ struct Config {
     data_type: DataType,
     file_number: u16,
     value_opts: ValueOptions,
-    lufkin: bool,
     poll_once: bool,
     poll_rate: Duration,
     timeout: Duration,
@@ -244,10 +239,6 @@ impl Config {
             bail!("stop bits must be 1 or 2");
         }
 
-        if cli.lufkin && !matches!(protocol, Protocol::Rtu | Protocol::Enc) {
-            bail!("Lufkin ELAM extensions (-x) are only valid with Modbus RTU or RTU over TCP");
-        }
-
         if !cli.write_values.is_empty() && !data_type.is_writable() {
             bail!("data type {} cannot be written", data_type.describe());
         }
@@ -270,7 +261,6 @@ impl Config {
                 big_endian_int: big_int,
                 big_endian_float: big_float,
             },
-            lufkin: cli.lufkin,
             poll_once: cli.poll_once,
             poll_rate: Duration::from_millis(cli.poll_rate_ms),
             timeout: Duration::from_secs_f64(cli.timeout),
@@ -353,9 +343,6 @@ fn print_header(cfg: &Config) {
         println!("RS-485 mode: RTS asserted (+{ms} ms)");
     }
 
-    if cfg.lufkin {
-        eprintln!("warning: Lufkin ELAM extensions (-x) are accepted but not implemented");
-    }
     println!();
 }
 
