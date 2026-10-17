@@ -296,9 +296,14 @@ impl SlaveContext for UdpClient {
 // RS-485 aware serial transport
 // ---------------------------------------------------------------------------
 
+/// Polling interval while waiting for the serial driver to finish sending
+/// pending bytes (`bytes_to_write() == 0`).
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
 enum FlushState {
     Idle,
     Flushing,
+    Draining(Pin<Box<Sleep>>),
     Waiting(Pin<Box<Sleep>>),
 }
 
@@ -317,6 +322,22 @@ impl RtsStream {
             inner,
             delay,
             state: FlushState::Idle,
+        }
+    }
+
+    /// Advances the flush state machine through the drain stage: once the
+    /// driver has no pending bytes, schedule the RTS-off delay. If the driver
+    /// cannot report pending bytes, fall back to just the delay.
+    fn drain_check(&mut self) {
+        let delay = self.delay.expect("drain only runs with an RTS delay");
+        match self.inner.bytes_to_write() {
+            Ok(0) | Err(_) => {
+                self.state = FlushState::Waiting(Box::pin(tokio::time::sleep(delay)));
+            }
+            Ok(_) => {
+                self.state =
+                    FlushState::Draining(Box::pin(tokio::time::sleep(DRAIN_POLL_INTERVAL)));
+            }
         }
     }
 }
@@ -359,8 +380,14 @@ impl AsyncWrite for RtsStream {
                 }
                 FlushState::Flushing => {
                     ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
-                    let sleep = Box::pin(tokio::time::sleep(this.delay.unwrap()));
-                    this.state = FlushState::Waiting(sleep);
+                    this.drain_check();
+                }
+                FlushState::Draining(mut sleep) => {
+                    if sleep.as_mut().poll(cx).is_pending() {
+                        this.state = FlushState::Draining(sleep);
+                        return Poll::Pending;
+                    }
+                    this.drain_check();
                 }
                 FlushState::Waiting(mut sleep) => {
                     if sleep.as_mut().poll(cx).is_pending() {
