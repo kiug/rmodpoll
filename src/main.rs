@@ -440,6 +440,22 @@ where
 }
 
 async fn run(cfg: &Config) -> Result<()> {
+    if cfg.write_values.is_empty() {
+        run_read(cfg).await
+    } else {
+        run_write(cfg).await
+    }
+}
+
+/// Write mode mirrors `modpoll`: perform a single write and exit.
+async fn run_write(cfg: &Config) -> Result<()> {
+    let mut ctx = connect(cfg).await?;
+    let result = do_write(&mut ctx, cfg).await;
+    disconnect(ctx).await;
+    result
+}
+
+async fn run_read(cfg: &Config) -> Result<()> {
     let is_serial = cfg.protocol.is_serial();
     let mut ctx: Option<Context> = None;
 
@@ -462,7 +478,7 @@ async fn run(cfg: &Config) -> Result<()> {
             }
         }
 
-        match poll(ctx.as_mut().expect("connection established above"), cfg).await {
+        match do_read(ctx.as_mut().expect("connection established above"), cfg).await {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("Error: {e:#}");
@@ -496,15 +512,6 @@ async fn run(cfg: &Config) -> Result<()> {
 /// Gracefully shuts down a client context, ignoring any error.
 async fn disconnect(mut connection: Context) {
     let _ = connection.disconnect().await;
-}
-
-/// Performs a single read or write operation against an open connection.
-async fn poll(ctx: &mut Context, cfg: &Config) -> Result<()> {
-    if cfg.write_values.is_empty() {
-        do_read(ctx, cfg).await
-    } else {
-        do_write(ctx, cfg).await
-    }
 }
 
 async fn do_read(ctx: &mut Context, cfg: &Config) -> Result<()> {
