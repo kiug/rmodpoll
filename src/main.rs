@@ -440,36 +440,43 @@ where
 }
 
 async fn run(cfg: &Config) -> Result<()> {
-    // Serial transports keep a single open port for the whole run, while
-    // network transports are re-established on every poll cycle so that a
-    // dropped TCP/UDP connection recovers automatically.
-    let persistent = cfg.protocol.is_serial();
-    let mut serial = if persistent {
-        Some(connect(cfg).await?)
-    } else {
-        None
-    };
-
-    let mut final_error = None;
+    let is_serial = cfg.protocol.is_serial();
+    let mut ctx: Option<Context> = None;
 
     loop {
-        let result = match serial.as_mut() {
-            Some(ctx) => poll(ctx, cfg).await,
-            None => match connect(cfg).await {
-                Ok(mut ctx) => {
-                    let result = poll(&mut ctx, cfg).await;
-                    let _ = ctx.disconnect().await;
-                    result
+        // Establish a connection when none is open. Serial ports are opened
+        // once and kept for the whole run; a network connection is re-opened
+        // only after a failed transaction.
+        if ctx.is_none() {
+            match connect(cfg).await {
+                Ok(connection) => ctx = Some(connection),
+                Err(e) => {
+                    let msg = format!("connection failed: {e:#}");
+                    if cfg.poll_once || is_serial {
+                        return Err(anyhow!(msg));
+                    }
+                    eprintln!("Error: {msg}");
+                    tokio::time::sleep(cfg.poll_rate).await;
+                    continue;
                 }
-                Err(e) => Err(anyhow!("connection failed: {e:#}")),
-            },
-        };
+            }
+        }
 
-        match result {
+        match poll(ctx.as_mut().expect("connection established above"), cfg).await {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("Error: {e:#}");
-                final_error = Some(e);
+                if cfg.poll_once {
+                    return Err(e);
+                }
+                // A failed transaction may have left a network connection in a
+                // broken state, so drop it and reconnect on the next cycle. A
+                // serial port stays open (a timeout does not close it).
+                if !is_serial {
+                    if let Some(connection) = ctx.take() {
+                        disconnect(connection).await;
+                    }
+                }
             }
         }
 
@@ -480,14 +487,15 @@ async fn run(cfg: &Config) -> Result<()> {
         tokio::time::sleep(cfg.poll_rate).await;
     }
 
-    if let Some(ctx) = serial.as_mut() {
-        let _ = ctx.disconnect().await;
+    if let Some(connection) = ctx {
+        disconnect(connection).await;
     }
+    Ok(())
+}
 
-    match final_error {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+/// Gracefully shuts down a client context, ignoring any error.
+async fn disconnect(mut connection: Context) {
+    let _ = connection.disconnect().await;
 }
 
 /// Performs a single read or write operation against an open connection.
