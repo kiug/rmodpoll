@@ -89,10 +89,6 @@ struct Cli {
     #[arg(short = 'f')]
     big_float: bool,
 
-    /// Daniel/Enron single-register 32-bit mode (implies -i and -f)
-    #[arg(short = 'e')]
-    enron: bool,
-
     /// First reference is 0 (PDU addressing) instead of 1
     #[arg(short = '0')]
     zero_based: bool,
@@ -243,8 +239,8 @@ impl Config {
             bail!("data type {} cannot be written", data_type.describe());
         }
 
-        let big_int = cli.big_int || cli.enron;
-        let big_float = cli.big_float || cli.enron;
+        let big_int = cli.big_int;
+        let big_float = cli.big_float;
 
         Ok(Self {
             protocol,
