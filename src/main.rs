@@ -24,6 +24,12 @@ enum Protocol {
     Enc,
 }
 
+impl Protocol {
+    fn is_serial(self) -> bool {
+        matches!(self, Protocol::Rtu | Protocol::Ascii)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParityArg {
     None,
@@ -317,11 +323,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::build(cli)?;
     print_header(&cfg);
-
-    let mut ctx = connect(&cfg).await?;
-    run(&mut ctx, &cfg).await?;
-    let _ = ctx.disconnect().await;
-    Ok(())
+    run(&cfg).await
 }
 
 fn print_header(cfg: &Config) {
@@ -459,21 +461,37 @@ where
     }
 }
 
-async fn run(ctx: &mut Context, cfg: &Config) -> Result<()> {
+async fn run(cfg: &Config) -> Result<()> {
+    // Serial transports keep a single open port for the whole run, while
+    // network transports are re-established on every poll cycle so that a
+    // dropped TCP/UDP connection recovers automatically.
+    let persistent = cfg.protocol.is_serial();
+    let mut serial = if persistent {
+        Some(connect(cfg).await?)
+    } else {
+        None
+    };
+
+    let mut final_error = None;
+
     loop {
-        let result = if cfg.write_values.is_empty() {
-            do_read(ctx, cfg).await
-        } else {
-            do_write(ctx, cfg).await
+        let result = match serial.as_mut() {
+            Some(ctx) => poll(ctx, cfg).await,
+            None => match connect(cfg).await {
+                Ok(mut ctx) => {
+                    let result = poll(&mut ctx, cfg).await;
+                    let _ = ctx.disconnect().await;
+                    result
+                }
+                Err(e) => Err(anyhow!("connection failed: {e:#}")),
+            },
         };
 
         match result {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("Error: {e:#}");
-                if cfg.poll_once {
-                    return Err(e);
-                }
+                final_error = Some(e);
             }
         }
 
@@ -483,7 +501,24 @@ async fn run(ctx: &mut Context, cfg: &Config) -> Result<()> {
         println!();
         tokio::time::sleep(cfg.poll_rate).await;
     }
-    Ok(())
+
+    if let Some(ctx) = serial.as_mut() {
+        let _ = ctx.disconnect().await;
+    }
+
+    match final_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Performs a single read or write operation against an open connection.
+async fn poll(ctx: &mut Context, cfg: &Config) -> Result<()> {
+    if cfg.write_values.is_empty() {
+        do_read(ctx, cfg).await
+    } else {
+        do_write(ctx, cfg).await
+    }
 }
 
 async fn do_read(ctx: &mut Context, cfg: &Config) -> Result<()> {
