@@ -551,14 +551,14 @@ async fn do_read(ctx: &mut Context, cfg: &Config) -> Result<()> {
         DataType::DeviceId => {
             let resp = timed(
                 cfg.timeout,
-                ctx.read_device_identification(ReadCode::Basic, 0),
+                ctx.read_device_identification(ReadCode::Extended, 0),
             )
             .await?;
             print_device_id(&resp);
         }
         DataType::File => {
             let words = read_file(ctx, cfg).await?;
-            print_file_words(cfg.record_number(), &words);
+            print_file_words(&words);
         }
         // The guard arms above cover every register variant; this is only
         // here to satisfy exhaustiveness checking.
@@ -649,41 +649,21 @@ fn print_registers(
 
 fn print_device_id(resp: &ReadDeviceIdentificationResponse) {
     for obj in &resp.device_id_objects {
-        let value = obj.value_as_str().map(str::to_owned).unwrap_or_else(|| {
-            obj.value
-                .iter()
-                .map(|b| format!("{b:02X}"))
-                .collect::<String>()
-        });
-        println!("  {} (0x{:02X}): {value}", object_name(obj.id), obj.id);
+        let value = String::from_utf8_lossy(obj.value.as_ref());
+        println!("[{}]: '{value}', len = {}", obj.id, obj.value.len());
     }
 }
 
-fn object_name(id: u8) -> &'static str {
-    match id {
-        0x00 => "VendorName",
-        0x01 => "ProductCode",
-        0x02 => "MajorMinorRevision",
-        0x03 => "VendorUrl",
-        0x04 => "ProductName",
-        0x05 => "ModelName",
-        0x06 => "UserApplicationName",
-        0x07..=0x7F => "Reserved",
-        0x80..=0xFF => "Private",
-    }
-}
-
-fn print_file_words(record_number: u16, words: &[u16]) {
+fn print_file_words(words: &[u16]) {
     for (i, word) in words.iter().enumerate() {
-        println!(
-            "[{}]: 0x{word:04X} ({word})",
-            u32::from(record_number) + i as u32
-        );
+        println!("[{i}]: {word}");
     }
 }
 
 async fn read_file(ctx: &mut Context, cfg: &Config) -> Result<Vec<u16>> {
-    let mut data = vec![0x06u8];
+    // FC20 sub-request preceded by its byte count: reference type (1) +
+    // file number (2) + record number (2) + record length (2) = 7 bytes.
+    let mut data = vec![0x07, 0x06];
     push_u16(&mut data, cfg.file_number);
     push_u16(&mut data, cfg.record_number());
     push_u16(&mut data, cfg.value_count());
@@ -703,7 +683,11 @@ async fn read_file(ctx: &mut Context, cfg: &Config) -> Result<Vec<u16>> {
 async fn write_file(ctx: &mut Context, cfg: &Config) -> Result<()> {
     let words = encode_write_words(DataType::HoldingReg16, &cfg.write_values, &cfg.value_opts)?;
 
-    let mut data = vec![0x06u8];
+    // FC21 sub-request preceded by its byte count: reference type (1) +
+    // file number (2) + record number (2) + record length (2) + data (2N).
+    let mut data = Vec::with_capacity(8 + 2 * words.len());
+    data.push((7 + 2 * words.len()) as u8);
+    data.push(0x06);
     push_u16(&mut data, cfg.file_number);
     push_u16(&mut data, cfg.record_number());
     push_u16(&mut data, words.len() as u16);
