@@ -2,6 +2,7 @@
 name = "rmodpoll"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "GPL-2.0-only"
 authors = ["Karol Drożak <karoldro@gmail.com>"]
 

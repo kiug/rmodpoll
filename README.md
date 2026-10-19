@@ -20,7 +20,7 @@ tool and supports all of its protocols, data types and function codes.
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.88+ (edition 2024)
 
 ## Building
 
@@ -150,6 +150,44 @@ Read device identification objects (FC 43/14):
 ```sh
 rmodpoll -m tcp -t id 192.168.1.10
 ```
+
+Modbus UDP (default port 502, or specify one with `-p`):
+
+```sh
+rmodpoll -m udp -t 4 -r 1 -c 4 192.168.1.10
+rmodpoll -m udp -p 1502 -t 4 -r 1 -c 4 192.168.1.10
+```
+
+Encapsulated Modbus RTU over TCP (`enc`):
+
+```sh
+rmodpoll -m enc -t 4 -r 1 -c 4 192.168.1.10
+```
+
+Read a file record (FC 20):
+
+```sh
+rmodpoll -m tcp -t file -n 4 -r 1 -c 2 192.168.1.10
+```
+
+## Testing
+
+The test suite uses an in-process Modbus TCP server and in-memory mock
+serial/UDP transports, so no hardware or network is required:
+
+```sh
+cargo test
+```
+
+To measure line coverage with `cargo-llvm-cov`:
+
+```sh
+cargo llvm-cov
+```
+
+Coverage is currently around 89% across the crate (82 tests). CI runs
+`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and
+`cargo llvm-cov` on every push and pull request.
 
 ## Notes
 
