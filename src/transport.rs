@@ -218,27 +218,56 @@ fn decode_device_id(data: &[u8]) -> Result<Response, String> {
 // Modbus UDP client
 // ---------------------------------------------------------------------------
 
+/// Abstraction over the datagram send/receive that [`UdpClient`] needs.
+/// Implemented by `tokio::net::UdpSocket` in production and by a mock in tests.
+#[async_trait]
+trait UdpTransport: Send {
+    async fn send(&mut self, data: &[u8]) -> io::Result<usize>;
+    async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+}
+
+#[async_trait]
+impl UdpTransport for tokio::net::UdpSocket {
+    async fn send(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.send(data).await
+    }
+
+    async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv(buf).await
+    }
+}
+
 /// A Modbus-over-UDP client using the same MBAP header as Modbus TCP.
-pub struct UdpClient {
-    socket: tokio::net::UdpSocket,
+pub struct UdpClient<T> {
+    transport: T,
     slave: Slave,
     transaction: u16,
 }
 
-impl UdpClient {
-    pub async fn new(addr: std::net::SocketAddr, slave: Slave) -> io::Result<Self> {
+impl UdpClient<tokio::net::UdpSocket> {
+    /// Connects to a Modbus UDP server.
+    pub async fn connect(addr: std::net::SocketAddr, slave: Slave) -> io::Result<Self> {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(addr).await?;
-        Ok(Self {
-            socket,
+        Ok(Self::new(socket, slave))
+    }
+}
+
+impl<T> UdpClient<T> {
+    pub fn new(transport: T, slave: Slave) -> Self {
+        Self {
+            transport,
             slave,
             transaction: 1,
-        })
+        }
     }
 }
 
 #[async_trait]
-impl Client for UdpClient {
+impl<T> Client for UdpClient<T>
+where
+    T: UdpTransport + 'static,
+{
     async fn call(&mut self, req: Request<'_>) -> tokio_modbus::Result<Response> {
         let pdu = encode_request_pdu(&req).map_err(protocol_err)?;
 
@@ -254,10 +283,10 @@ impl Client for UdpClient {
         frame.push(self.slave.0);
         frame.extend_from_slice(&pdu);
 
-        self.socket.send(&frame).await?;
+        self.transport.send(&frame).await?;
 
         let mut buf = [0u8; 260];
-        let n = self.socket.recv(&mut buf).await?;
+        let n = self.transport.recv(&mut buf).await?;
         if n < 8 {
             return Err(protocol_err("short UDP response"));
         }
@@ -286,7 +315,7 @@ impl Client for UdpClient {
     }
 }
 
-impl SlaveContext for UdpClient {
+impl<T> SlaveContext for UdpClient<T> {
     fn set_slave(&mut self, slave: Slave) {
         self.slave = slave;
     }
@@ -453,13 +482,13 @@ pub type RtsSerialStream = RtsStream<tokio_serial::SerialStream>;
 
 /// A Modbus ASCII client. The PDU is framed with `:` / CRLF and an LRC checksum
 /// and encoded as hexadecimal characters over a serial line.
-pub struct AsciiClient {
-    port: RtsSerialStream,
+pub struct AsciiClient<T> {
+    port: T,
     slave: Slave,
 }
 
-impl AsciiClient {
-    pub fn new(port: RtsSerialStream, slave: Slave) -> Self {
+impl<T> AsciiClient<T> {
+    pub fn new(port: T, slave: Slave) -> Self {
         Self { port, slave }
     }
 }
@@ -475,7 +504,10 @@ fn hex_byte(b: u8) -> String {
 }
 
 #[async_trait]
-impl Client for AsciiClient {
+impl<T> Client for AsciiClient<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     async fn call(&mut self, req: Request<'_>) -> tokio_modbus::Result<Response> {
         let pdu = encode_request_pdu(&req).map_err(protocol_err)?;
 
@@ -549,7 +581,7 @@ impl Client for AsciiClient {
     }
 }
 
-impl SlaveContext for AsciiClient {
+impl<T> SlaveContext for AsciiClient<T> {
     fn set_slave(&mut self, slave: Slave) {
         self.slave = slave;
     }
@@ -644,6 +676,100 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn encode_additional_requests() {
+        use std::borrow::Cow;
+
+        // FC2 / FC4
+        assert_eq!(
+            encode_request_pdu(&Request::ReadDiscreteInputs(0x006B, 3)).unwrap(),
+            vec![0x02, 0x00, 0x6B, 0x00, 0x03]
+        );
+        assert_eq!(
+            encode_request_pdu(&Request::ReadInputRegisters(0x006B, 3)).unwrap(),
+            vec![0x04, 0x00, 0x6B, 0x00, 0x03]
+        );
+
+        // FC5 (ON / OFF)
+        assert_eq!(
+            encode_request_pdu(&Request::WriteSingleCoil(0x00AC, true)).unwrap(),
+            vec![0x05, 0x00, 0xAC, 0xFF, 0x00]
+        );
+        assert_eq!(
+            encode_request_pdu(&Request::WriteSingleCoil(0x00AC, false)).unwrap(),
+            vec![0x05, 0x00, 0xAC, 0x00, 0x00]
+        );
+
+        // FC6
+        assert_eq!(
+            encode_request_pdu(&Request::WriteSingleRegister(0x0001, 0x0003)).unwrap(),
+            vec![0x06, 0x00, 0x01, 0x00, 0x03]
+        );
+
+        // FC15 (3 coils: on, off, on)
+        assert_eq!(
+            encode_request_pdu(&Request::WriteMultipleCoils(
+                0x0013,
+                Cow::Borrowed(&[true, false, true][..])
+            ))
+            .unwrap(),
+            vec![0x0F, 0x00, 0x13, 0x00, 0x03, 0x01, 0x05]
+        );
+
+        // FC43 (read device identification)
+        assert_eq!(
+            encode_request_pdu(&Request::ReadDeviceIdentification(ReadCode::Basic, 0)).unwrap(),
+            vec![0x2B, 0x0E, 0x01, 0x00]
+        );
+
+        // Custom
+        assert_eq!(
+            encode_request_pdu(&Request::Custom(0x14, Cow::Borrowed(&[0x07, 0x06][..]))).unwrap(),
+            vec![0x14, 0x07, 0x06]
+        );
+    }
+
+    #[test]
+    fn decode_additional_responses() {
+        // FC2
+        assert_eq!(
+            decode_response_pdu(0x02, &[0x01, 0x05]).unwrap(),
+            Response::ReadDiscreteInputs(vec![
+                true, false, true, false, false, false, false, false
+            ])
+        );
+
+        // FC4
+        assert_eq!(
+            decode_response_pdu(0x04, &[0x04, 0x00, 0x0A, 0x00, 0x14]).unwrap(),
+            Response::ReadInputRegisters(vec![10, 20])
+        );
+
+        // FC5
+        assert_eq!(
+            decode_response_pdu(0x05, &[0x00, 0xAC, 0xFF, 0x00]).unwrap(),
+            Response::WriteSingleCoil(0xAC, true)
+        );
+
+        // FC6
+        assert_eq!(
+            decode_response_pdu(0x06, &[0x00, 0x01, 0x00, 0x03]).unwrap(),
+            Response::WriteSingleRegister(0x01, 0x03)
+        );
+
+        // FC15
+        assert_eq!(
+            decode_response_pdu(0x0F, &[0x00, 0x13, 0x00, 0x03]).unwrap(),
+            Response::WriteMultipleCoils(0x13, 3)
+        );
+
+        // Custom
+        assert_eq!(
+            decode_response_pdu(0x14, &[0xAA, 0xBB]).unwrap(),
+            Response::Custom(0x14, Bytes::from(vec![0xAA, 0xBB]))
+        );
     }
 
     #[test]
@@ -778,5 +904,153 @@ mod tests {
 
         assert!(!observer.rts(), "RTS should be deasserted after draining");
         assert_eq!(observer.rts_calls(), vec![true, false]);
+    }
+
+    // ------------------------------------------------------------------
+    // UDP / ASCII client `call` with a mocked transport
+    // ------------------------------------------------------------------
+
+    use std::collections::VecDeque;
+
+    #[derive(Clone)]
+    struct MockIo {
+        written: Arc<Mutex<Vec<u8>>>,
+        response: Arc<Mutex<VecDeque<u8>>>,
+    }
+
+    impl MockIo {
+        fn new(response: Vec<u8>) -> Self {
+            Self {
+                written: Arc::new(Mutex::new(Vec::new())),
+                response: Arc::new(Mutex::new(response.into())),
+            }
+        }
+
+        fn written(&self) -> Vec<u8> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    impl AsyncRead for MockIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let mut response = self.response.lock().unwrap();
+            let n = response.len().min(buf.remaining());
+            let bytes: Vec<u8> = response.drain(..n).collect();
+            buf.put_slice(&bytes);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for MockIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockUdp {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        response: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    impl MockUdp {
+        fn new(responses: Vec<Vec<u8>>) -> Self {
+            Self {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                response: Arc::new(Mutex::new(responses.into())),
+            }
+        }
+
+        fn sent_frames(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl UdpTransport for MockUdp {
+        async fn send(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.sent.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+
+        async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let resp = self.response.lock().unwrap().pop_front().unwrap();
+            let n = resp.len().min(buf.len());
+            buf[..n].copy_from_slice(&resp[..n]);
+            Ok(n)
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_client_call_round_trip() {
+        // MBAP response: txn=1, proto=0, len=5, unit=1, FC3 + 1 register (0x1234).
+        let response = vec![
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x12, 0x34,
+        ];
+        let mock = MockUdp::new(vec![response]);
+        let observer = mock.clone();
+        let mut client = UdpClient::new(mock, Slave::from(1));
+
+        let resp = client
+            .call(Request::ReadHoldingRegisters(0, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp, Response::ReadHoldingRegisters(vec![0x1234]));
+
+        let sent = observer.sent_frames();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0],
+            vec![
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_client_rejects_mismatched_transaction() {
+        let response = vec![
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x12, 0x34,
+        ];
+        let mock = MockUdp::new(vec![response]);
+        let mut client = UdpClient::new(mock, Slave::from(1));
+
+        let result = client.call(Request::ReadHoldingRegisters(0, 1)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ascii_client_call_round_trip() {
+        // Response frame: slave 1, FC3, 1 register (0x1234), LRC 0xB4.
+        let mock = MockIo::new(b":0103021234B4\r\n".to_vec());
+        let observer = mock.clone();
+        let mut client = AsciiClient::new(mock, Slave::from(1));
+
+        let resp = client
+            .call(Request::ReadHoldingRegisters(0, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp, Response::ReadHoldingRegisters(vec![0x1234]));
+
+        assert_eq!(observer.written(), b":010300000001FB\r\n".to_vec());
     }
 }

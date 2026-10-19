@@ -365,7 +365,7 @@ async fn connect(cfg: &Config) -> Result<Context> {
         }
         Protocol::Udp => {
             let addr = resolve(&cfg.target, cfg.port).await?;
-            Context::from(Box::new(UdpClient::new(addr, slave).await?) as Box<dyn Client>)
+            Context::from(Box::new(UdpClient::connect(addr, slave).await?) as Box<dyn Client>)
         }
         Protocol::Enc => {
             let addr = resolve(&cfg.target, cfg.port).await?;
@@ -1129,5 +1129,279 @@ mod tests {
         let mut ctx = connect(&cfg).await.unwrap();
         let result = do_read(&mut ctx, &cfg).await;
         assert!(result.is_err(), "read should time out");
+    }
+
+    // ------------------------------------------------------------------
+    // `timed` timeout / error mapping
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn timed_returns_value_on_success() {
+        let result: Result<u16> = timed(Duration::from_secs(1), async { Ok(Ok(42u16)) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn timed_maps_modbus_exception() {
+        let result: Result<u16> = timed(Duration::from_secs(1), async {
+            Ok(Err(tokio_modbus::prelude::ExceptionCode::IllegalFunction))
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("exception"));
+    }
+
+    #[tokio::test]
+    async fn timed_maps_transport_error() {
+        let result: Result<u16> = timed(Duration::from_secs(1), async {
+            Err(tokio_modbus::Error::Transport(io::Error::new(
+                io::ErrorKind::Other,
+                "boom",
+            )))
+        })
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn timed_times_out() {
+        let result: Result<u16> = timed(
+            Duration::from_millis(1),
+            std::future::pending::<tokio_modbus::Result<u16>>(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
+    }
+
+    // ------------------------------------------------------------------
+    // CLI parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_read_invocation() {
+        let cli = Cli::try_parse_from([
+            "rmodpoll",
+            "-m",
+            "tcp",
+            "-a",
+            "2",
+            "-r",
+            "10",
+            "-c",
+            "5",
+            "-t",
+            "4:hex",
+            "192.168.1.10",
+        ])
+        .unwrap();
+        assert_eq!(cli.target, "192.168.1.10");
+        assert_eq!(cli.protocol, Some(Protocol::Tcp));
+        assert_eq!(cli.slave, 2);
+        assert_eq!(cli.start_ref, 10);
+        assert_eq!(cli.count, Some(5));
+        assert_eq!(cli.data_type, "4:hex");
+        assert!(cli.write_values.is_empty());
+    }
+
+    #[test]
+    fn cli_parses_write_invocation() {
+        let cli = Cli::try_parse_from(["rmodpoll", "192.168.1.10", "100", "200"]).unwrap();
+        assert_eq!(cli.write_values, vec!["100", "200"]);
+    }
+
+    #[test]
+    fn cli_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "rmodpoll",
+            "-0",
+            "-1",
+            "-u",
+            "-i",
+            "-f",
+            "-4",
+            "10",
+            "192.168.1.10",
+        ])
+        .unwrap();
+        assert!(cli.zero_based);
+        assert!(cli.poll_once);
+        assert!(cli.unsigned);
+        assert!(cli.big_int);
+        assert!(cli.big_float);
+        assert_eq!(cli.rts_delay_ms, Some(10));
+    }
+
+    #[test]
+    fn cli_rejects_unknown_flag() {
+        assert!(Cli::try_parse_from(["rmodpoll", "-z", "192.168.1.10"]).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Remaining pure-function / validation coverage
+    // ------------------------------------------------------------------
+
+    use tokio_modbus::bytes::Bytes;
+    use tokio_modbus::prelude::{ConformityLevel, DeviceIdObject};
+
+    #[test]
+    fn protocol_name_maps_all_variants() {
+        assert_eq!(protocol_name(Protocol::Ascii), "Modbus ASCII");
+        assert_eq!(protocol_name(Protocol::Rtu), "Modbus RTU");
+        assert_eq!(protocol_name(Protocol::Tcp), "Modbus TCP");
+        assert_eq!(protocol_name(Protocol::Udp), "Modbus UDP");
+        assert_eq!(
+            protocol_name(Protocol::Enc),
+            "Modbus RTU over TCP (encapsulated)"
+        );
+    }
+
+    #[test]
+    fn invalid_ip_port_rejected() {
+        let mut c = cli("192.168.1.10");
+        c.port_parity = Some("abc".to_string());
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn file_record_number_out_of_range() {
+        let mut c = cli("192.168.1.10");
+        c.data_type = "file".to_string();
+        c.start_ref = 65_536;
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn zero_based_start_ref_out_of_range() {
+        let mut c = cli("192.168.1.10");
+        c.zero_based = true;
+        c.start_ref = 65_536;
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn invalid_data_bits_rejected() {
+        let mut c = cli("COM1");
+        c.protocol = Some(Protocol::Ascii);
+        c.data_bits = Some(6);
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn invalid_stop_bits_rejected() {
+        let mut c = cli("192.168.1.10");
+        c.stop_bits = 3;
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn invalid_data_type_rejected() {
+        let mut c = cli("192.168.1.10");
+        c.data_type = "bogus".to_string();
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn file_read_response_error_paths() {
+        assert!(parse_file_read_response(&[]).is_err());
+        // fewer than 3 bytes
+        assert!(parse_file_read_response(&[0x06, 0x05]).is_err());
+        // byte_count claims 6 bytes but only 3 follow
+        assert!(parse_file_read_response(&[0x06, 0x05, 0x06, 0x00, 0x64]).is_err());
+        // sub_len of 0 is malformed
+        assert!(parse_file_read_response(&[0x02, 0x00, 0x06]).is_err());
+        // unexpected reference type 0x07
+        assert!(parse_file_read_response(&[0x04, 0x03, 0x07, 0x00, 0x64]).is_err());
+    }
+
+    #[test]
+    fn print_bits_formats_references() {
+        print_bits(0, false, &[true, false]);
+        print_bits(0, true, &[true]);
+    }
+
+    #[test]
+    fn print_file_words_formats_entries() {
+        print_file_words(&[0x1234, 0x5678]);
+    }
+
+    #[test]
+    fn print_device_id_prints_objects() {
+        let resp = ReadDeviceIdentificationResponse {
+            read_code: ReadCode::Extended,
+            conformity_level: ConformityLevel::ExtendedIdentification,
+            more_follows: false,
+            next_object_id: 0,
+            device_id_objects: vec![DeviceIdObject {
+                id: 0,
+                value: Bytes::from_static(b"ACME"),
+            }],
+        };
+        print_device_id(&resp);
+    }
+
+    // ------------------------------------------------------------------
+    // Additional in-process integration coverage
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn do_read_coils() {
+        let (addr, _store) = spawn_server(vec![1]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "0".to_string();
+        c.count = Some(2);
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_read(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn do_read_discrete_inputs() {
+        let (addr, _store) = spawn_server(vec![1]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "1".to_string();
+        c.count = Some(2);
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_read(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn do_read_input_registers() {
+        let (addr, _store) = spawn_server(vec![0x1111, 0x2222]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "3".to_string();
+        c.count = Some(2);
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_read(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn do_write_coils() {
+        let (addr, _store) = spawn_server(vec![1]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "0".to_string();
+        c.write_values = vec!["1".to_string(), "0".to_string()];
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_write(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn do_write_single_coil() {
+        let (addr, _store) = spawn_server(vec![1]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "0".to_string();
+        c.write_values = vec!["1".to_string()];
+        c.count = Some(1); // force FC5
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_write(&mut ctx, &cfg).await.unwrap();
     }
 }

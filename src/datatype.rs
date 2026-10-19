@@ -554,4 +554,147 @@ mod tests {
             encode_write_words(DataType::HoldingRegMod, &["12345678".to_string()], &big).unwrap();
         assert_eq!(words, vec![1234, 5678]);
     }
+
+    #[test]
+    fn i64_round_trip() {
+        // 0x0123456789ABCDEF
+        let little = ValueOptions::default();
+        let words = encode_write_words(
+            DataType::HoldingRegI64,
+            &["81985529216486895".to_string()],
+            &little,
+        )
+        .unwrap();
+        assert_eq!(words, vec![0xCDEF, 0x89AB, 0x4567, 0x0123]);
+        assert_eq!(
+            format_registers(&words, DataType::HoldingRegI64, &little).unwrap(),
+            vec!["81985529216486895".to_string()]
+        );
+
+        let big = ValueOptions {
+            big_endian_int: true,
+            ..ValueOptions::default()
+        };
+        let words = encode_write_words(
+            DataType::HoldingRegI64,
+            &["81985529216486895".to_string()],
+            &big,
+        )
+        .unwrap();
+        assert_eq!(words, vec![0x0123, 0x4567, 0x89AB, 0xCDEF]);
+    }
+
+    #[test]
+    fn f64_round_trip() {
+        // 1.5 = 0x3FF8000000000000
+        let little = ValueOptions::default();
+        let words =
+            encode_write_words(DataType::HoldingRegF64, &["1.5".to_string()], &little).unwrap();
+        assert_eq!(words, vec![0x0000, 0x0000, 0x0000, 0x3FF8]);
+        assert_eq!(
+            format_registers(&words, DataType::HoldingRegF64, &little).unwrap(),
+            vec!["1.5".to_string()]
+        );
+
+        let big = ValueOptions {
+            big_endian_float: true,
+            ..ValueOptions::default()
+        };
+        let words =
+            encode_write_words(DataType::HoldingRegF64, &["1.5".to_string()], &big).unwrap();
+        assert_eq!(words, vec![0x3FF8, 0x0000, 0x0000, 0x0000]);
+    }
+
+    #[test]
+    fn invalid_write_value_rejected() {
+        let opts = ValueOptions::default();
+        assert!(encode_write_words(DataType::HoldingReg16, &["70000".to_string()], &opts).is_err());
+        assert!(encode_write_words(DataType::HoldingReg16, &["abc".to_string()], &opts).is_err());
+        assert!(
+            encode_write_words(DataType::HoldingRegF32, &["not-a-float".to_string()], &opts)
+                .is_err()
+        );
+        assert!(parse_bits(&["2".to_string()]).is_err());
+    }
+
+    #[test]
+    fn format_registers_rejects_bad_word_count() {
+        let opts = ValueOptions::default();
+        // 3 words for a 2-word type (i32)
+        assert!(format_registers(&[1, 2, 3], DataType::HoldingRegI32, &opts).is_err());
+    }
+
+    #[test]
+    fn parse_bits_accepts_aliases() {
+        for s in ["1", "true", "on", "0xff00"] {
+            assert_eq!(parse_bits(&[s.to_string()]).unwrap(), vec![true]);
+        }
+        for s in ["0", "false", "off", "0x0000"] {
+            assert_eq!(parse_bits(&[s.to_string()]).unwrap(), vec![false]);
+        }
+    }
+
+    #[test]
+    fn format_registers_rejects_non_register_type() {
+        let opts = ValueOptions::default();
+        assert!(format_registers(&[], DataType::Coil, &opts).is_err());
+        assert!(format_registers(&[], DataType::DeviceId, &opts).is_err());
+    }
+
+    #[test]
+    fn write_accepts_signed_and_boundary_values() {
+        let opts = ValueOptions::default();
+        assert_eq!(
+            encode_write_words(DataType::HoldingReg16, &["-1".to_string()], &opts).unwrap(),
+            vec![0xFFFF]
+        );
+        assert_eq!(
+            encode_write_words(DataType::HoldingReg16, &["-32768".to_string()], &opts).unwrap(),
+            vec![0x8000]
+        );
+        assert_eq!(
+            encode_write_words(DataType::HoldingReg16, &["65535".to_string()], &opts).unwrap(),
+            vec![0xFFFF]
+        );
+        assert!(encode_write_words(DataType::HoldingReg16, &["65536".to_string()], &opts).is_err());
+    }
+
+    #[test]
+    fn hex_prefix_is_case_insensitive() {
+        let opts = ValueOptions::default();
+        assert_eq!(
+            encode_write_words(DataType::HoldingReg16, &["0X1234".to_string()], &opts).unwrap(),
+            vec![0x1234]
+        );
+    }
+
+    #[test]
+    fn write_32bit_out_of_range_rejected() {
+        let opts = ValueOptions::default();
+        assert!(
+            encode_write_words(DataType::HoldingRegI32, &["4294967296".to_string()], &opts)
+                .is_err()
+        );
+        assert_eq!(
+            encode_write_words(DataType::HoldingRegI32, &["-1".to_string()], &opts).unwrap(),
+            vec![0xFFFF, 0xFFFF]
+        );
+    }
+
+    #[test]
+    fn unsigned_i32_display() {
+        let opts = ValueOptions {
+            unsigned: true,
+            ..ValueOptions::default()
+        };
+        let values = format_registers(&[0xFFFF, 0xFFFF], DataType::HoldingRegI32, &opts).unwrap();
+        assert_eq!(values, vec!["4294967295".to_string()]);
+    }
+
+    #[test]
+    fn encode_write_words_rejects_non_writable_type() {
+        let opts = ValueOptions::default();
+        assert!(encode_write_words(DataType::Coil, &["1".to_string()], &opts).is_err());
+        assert!(encode_write_words(DataType::DiscreteInput, &["1".to_string()], &opts).is_err());
+    }
 }
