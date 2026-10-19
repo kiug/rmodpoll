@@ -734,6 +734,12 @@ fn parse_file_read_response(bytes: &[u8]) -> Result<Vec<u16>> {
     }
 
     let data = &bytes[3..2 + sub_len];
+    // File record data is a sequence of 16-bit words, so it must have an even
+    // byte length. Reject odd-length data instead of panicking on the pair
+    // access below when the peer sends a malformed frame.
+    if !data.len().is_multiple_of(2) {
+        bail!("malformed file read sub-response: odd data length");
+    }
     let mut words = Vec::with_capacity(data.len() / 2);
     for i in (0..data.len()).step_by(2) {
         words.push(u16::from_be_bytes([data[i], data[i + 1]]));
@@ -1312,6 +1318,8 @@ mod tests {
         assert!(parse_file_read_response(&[0x02, 0x00, 0x06]).is_err());
         // unexpected reference type 0x07
         assert!(parse_file_read_response(&[0x04, 0x03, 0x07, 0x00, 0x64]).is_err());
+        // odd data length would previously panic on the word-pair access
+        assert!(parse_file_read_response(&[0x03, 0x02, 0x06, 0x64]).is_err());
     }
 
     #[test]
