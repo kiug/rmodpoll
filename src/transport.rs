@@ -1270,4 +1270,29 @@ mod tests {
         let result = client.call(Request::ReadHoldingRegisters(0, 1)).await;
         assert!(result.unwrap().is_err());
     }
+
+    #[tokio::test]
+    async fn udp_client_exception_response() {
+        // MBAP: txn=1, len=3, unit=1, FC3|0x80 = 0x83, exception code 2.
+        let response = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01, 0x83, 0x02];
+        let mock = MockUdp::new(vec![response]);
+        let mut client = UdpClient::new(mock, Slave::from(1));
+
+        let result = client.call(Request::ReadHoldingRegisters(0, 1)).await;
+        assert!(result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn ascii_client_oversized_response() {
+        // 1025 bytes with no newline terminator exceed the frame size limit.
+        let mock = MockIo::new(vec![b'A'; 1025]);
+        let mut client = AsciiClient::new(mock, Slave::from(1));
+
+        assert!(
+            client
+                .call(Request::ReadHoldingRegisters(0, 1))
+                .await
+                .is_err()
+        );
+    }
 }

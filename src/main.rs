@@ -915,6 +915,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    use async_trait::async_trait;
+
     #[derive(Clone)]
     struct Store(Arc<Mutex<Vec<u16>>>);
 
@@ -1508,5 +1510,144 @@ mod tests {
         let cfg = Config::build(c).unwrap();
         let mut ctx = connect(&cfg).await.unwrap();
         do_write(&mut ctx, &cfg).await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Error paths: connect failures, reconnects and unexpected responses
+    // ------------------------------------------------------------------
+
+    /// A `Client` stub that always returns a fixed response, used to exercise
+    /// the error arms of `read_file`/`write_file` without a live server.
+    struct StubClient {
+        response: Response,
+    }
+
+    #[async_trait]
+    impl Client for StubClient {
+        async fn call(&mut self, _req: Request<'_>) -> tokio_modbus::Result<Response> {
+            Ok(Ok(self.response.clone()))
+        }
+
+        async fn disconnect(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tokio_modbus::prelude::SlaveContext for StubClient {
+        fn set_slave(&mut self, _slave: Slave) {}
+    }
+
+    fn stub_ctx(response: Response) -> Context {
+        Context::from(Box::new(StubClient { response }) as Box<dyn Client>)
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_unexpected_function_code() {
+        let mut c = cli("192.168.1.10");
+        c.data_type = "file".to_string();
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = stub_ctx(Response::Custom(0x94, Bytes::from(vec![0x01])));
+        assert!(read_file(&mut ctx, &cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_unexpected_response() {
+        let mut c = cli("192.168.1.10");
+        c.data_type = "file".to_string();
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = stub_ctx(Response::ReadHoldingRegisters(vec![1]));
+        assert!(read_file(&mut ctx, &cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_unexpected_function_code() {
+        let mut c = cli("192.168.1.10");
+        c.data_type = "file".to_string();
+        c.write_values = vec!["1".to_string()];
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = stub_ctx(Response::Custom(0x95, Bytes::from(vec![0x01])));
+        assert!(write_file(&mut ctx, &cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_unexpected_response() {
+        let mut c = cli("192.168.1.10");
+        c.data_type = "file".to_string();
+        c.write_values = vec!["1".to_string()];
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = stub_ctx(Response::ReadHoldingRegisters(vec![1]));
+        assert!(write_file(&mut ctx, &cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_tcp_to_closed_port_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(port.to_string());
+        let cfg = Config::build(c).unwrap();
+        assert!(connect(&cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_read_connect_failure_returns_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(port.to_string());
+        c.poll_once = true;
+        let cfg = Config::build(c).unwrap();
+        assert!(run_read(&cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_read_reconnects_after_transaction_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(Mutex::new(0usize));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+                let n = {
+                    let mut guard = counter.lock().unwrap();
+                    *guard += 1;
+                    *guard
+                };
+                if n == 1 {
+                    // Close the first connection immediately to force a
+                    // transaction error and a reconnect on the next cycle.
+                    drop(socket);
+                    continue;
+                }
+                let store = Store(Arc::new(Mutex::new(vec![0x1234])));
+                tokio::spawn(async move {
+                    let _ = serve_connection(socket, &store).await;
+                });
+            }
+        });
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.count = Some(1);
+        c.timeout = 0.1;
+        c.poll_rate_ms = 10;
+        let cfg = Config::build(c).unwrap();
+
+        // `run_read` should keep polling; after the failed first transaction it
+        // must reconnect and receive a fresh connection.
+        let result = tokio::time::timeout(Duration::from_millis(500), run_read(&cfg)).await;
+        assert!(result.is_err(), "run_read should still be polling");
+        assert!(
+            *connections.lock().unwrap() >= 2,
+            "should reconnect after a failed transaction"
+        );
     }
 }

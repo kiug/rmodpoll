@@ -687,4 +687,28 @@ mod tests {
         assert!(encode_write_words(DataType::Coil, &["1".to_string()], &opts).is_err());
         assert!(encode_write_words(DataType::DiscreteInput, &["1".to_string()], &opts).is_err());
     }
+
+    #[test]
+    fn write_rejects_invalid_hex_and_range() {
+        let opts = ValueOptions::default();
+        // Invalid hex digits after the 0x prefix.
+        assert!(
+            encode_write_words(DataType::HoldingReg16, &["0xZZZZ".to_string()], &opts).is_err()
+        );
+        assert!(
+            encode_write_words(DataType::HoldingRegI32, &["0xZZZZ".to_string()], &opts).is_err()
+        );
+        assert!(
+            encode_write_words(DataType::HoldingRegI64, &["0xZZZZ".to_string()], &opts).is_err()
+        );
+        // Below the signed 16-bit lower bound.
+        assert!(
+            encode_write_words(DataType::HoldingReg16, &["-32769".to_string()], &opts).is_err()
+        );
+        // Below the signed 32-bit lower bound.
+        assert!(
+            encode_write_words(DataType::HoldingRegI32, &["-2147483649".to_string()], &opts)
+                .is_err()
+        );
+    }
 }
