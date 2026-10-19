@@ -647,14 +647,18 @@ fn print_registers(
 
 fn print_device_id(resp: &ReadDeviceIdentificationResponse) {
     for obj in &resp.device_id_objects {
-        let value = String::from_utf8_lossy(obj.value.as_ref());
+        let raw = obj.value.as_ref();
+        // `modpoll` treats the value as a C string: it stops displaying at the
+        // first NUL byte, while still reporting the full byte length.
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let value = String::from_utf8_lossy(&raw[..end]);
         println!("[{}]: '{value}', len = {}", obj.id, obj.value.len());
     }
 }
 
 fn print_file_words(words: &[u16]) {
     for (i, word) in words.iter().enumerate() {
-        println!("[{i}]: {word}");
+        println!("[{}]: {word}", i + 1);
     }
 }
 
