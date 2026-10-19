@@ -7,7 +7,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -307,17 +307,35 @@ enum FlushState {
     Waiting(Pin<Box<Sleep>>),
 }
 
-/// Wraps a serial stream and, when an RTS delay is configured, asserts RTS
+/// Abstraction over the RTS control and transmit-queue inspection that
+/// [`RtsStream`] needs. Implemented by `tokio_serial::SerialStream` in
+/// production and by a mock in tests.
+trait RtsControl {
+    fn set_rts(&mut self, level: bool) -> io::Result<()>;
+    fn pending_bytes(&mut self) -> io::Result<u32>;
+}
+
+impl RtsControl for tokio_serial::SerialStream {
+    fn set_rts(&mut self, level: bool) -> io::Result<()> {
+        self.write_request_to_send(level).map_err(io::Error::other)
+    }
+
+    fn pending_bytes(&mut self) -> io::Result<u32> {
+        self.bytes_to_write().map_err(io::Error::other)
+    }
+}
+
+/// Wraps a serial transport and, when an RTS delay is configured, asserts RTS
 /// before writing and deasserts it after the data has been flushed plus the
 /// requested delay. This is the classic half-duplex RS-485 turnaround control.
-pub struct RtsStream {
-    inner: tokio_serial::SerialStream,
+pub struct RtsStream<T> {
+    inner: T,
     delay: Option<Duration>,
     state: FlushState,
 }
 
-impl RtsStream {
-    pub fn new(inner: tokio_serial::SerialStream, delay: Option<Duration>) -> Self {
+impl<T> RtsStream<T> {
+    pub fn new(inner: T, delay: Option<Duration>) -> Self {
         Self {
             inner,
             delay,
@@ -328,9 +346,12 @@ impl RtsStream {
     /// Advances the flush state machine through the drain stage: once the
     /// driver has no pending bytes, schedule the RTS-off delay. If the driver
     /// cannot report pending bytes, fall back to just the delay.
-    fn drain_check(&mut self) {
+    fn drain_check(&mut self)
+    where
+        T: RtsControl,
+    {
         let delay = self.delay.expect("drain only runs with an RTS delay");
-        match self.inner.bytes_to_write() {
+        match self.inner.pending_bytes() {
             Ok(0) | Err(_) => {
                 self.state = FlushState::Waiting(Box::pin(tokio::time::sleep(delay)));
             }
@@ -342,7 +363,10 @@ impl RtsStream {
     }
 }
 
-impl AsyncRead for RtsStream {
+impl<T> AsyncRead for RtsStream<T>
+where
+    T: AsyncRead + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -352,7 +376,10 @@ impl AsyncRead for RtsStream {
     }
 }
 
-impl AsyncWrite for RtsStream {
+impl<T> AsyncWrite for RtsStream<T>
+where
+    T: AsyncWrite + RtsControl + Unpin,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -360,9 +387,9 @@ impl AsyncWrite for RtsStream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if this.delay.is_some() {
-            this.inner
-                .write_request_to_send(true)
-                .map_err(io::Error::other)?;
+            if let Err(e) = this.inner.set_rts(true) {
+                return Poll::Ready(Err(e));
+            }
         }
         Pin::new(&mut this.inner).poll_write(cx, buf)
     }
@@ -379,7 +406,11 @@ impl AsyncWrite for RtsStream {
                     this.state = FlushState::Flushing;
                 }
                 FlushState::Flushing => {
-                    ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+                    match Pin::new(&mut this.inner).poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
                     this.drain_check();
                 }
                 FlushState::Draining(mut sleep) => {
@@ -394,9 +425,9 @@ impl AsyncWrite for RtsStream {
                         this.state = FlushState::Waiting(sleep);
                         return Poll::Pending;
                     }
-                    this.inner
-                        .write_request_to_send(false)
-                        .map_err(io::Error::other)?;
+                    if let Err(e) = this.inner.set_rts(false) {
+                        return Poll::Ready(Err(e));
+                    }
                     this.state = FlushState::Idle;
                     return Poll::Ready(Ok(()));
                 }
@@ -407,11 +438,14 @@ impl AsyncWrite for RtsStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.delay.is_some() {
-            let _ = this.inner.write_request_to_send(false);
+            let _ = this.inner.set_rts(false);
         }
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
+
+/// `RtsStream` over a real serial port.
+pub type RtsSerialStream = RtsStream<tokio_serial::SerialStream>;
 
 // ---------------------------------------------------------------------------
 // Modbus ASCII client
@@ -420,12 +454,12 @@ impl AsyncWrite for RtsStream {
 /// A Modbus ASCII client. The PDU is framed with `:` / CRLF and an LRC checksum
 /// and encoded as hexadecimal characters over a serial line.
 pub struct AsciiClient {
-    port: RtsStream,
+    port: RtsSerialStream,
     slave: Slave,
 }
 
 impl AsciiClient {
-    pub fn new(port: RtsStream, slave: Slave) -> Self {
+    pub fn new(port: RtsSerialStream, slave: Slave) -> Self {
         Self { port, slave }
     }
 }
@@ -629,5 +663,120 @@ mod tests {
         expected.push(checksum);
         assert_eq!(parse_ascii_frame(&frame).unwrap(), expected);
         assert_eq!(hex_byte(0x0F), "0F");
+    }
+
+    // ------------------------------------------------------------------
+    // RtsStream state machine
+    // ------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct MockSerial {
+        rts: Arc<Mutex<bool>>,
+        rts_calls: Arc<Mutex<Vec<bool>>>,
+        initial_pending: u32,
+        pending_calls: Arc<AtomicUsize>,
+    }
+
+    impl MockSerial {
+        fn new(initial_pending: u32) -> Self {
+            Self {
+                rts: Arc::new(Mutex::new(false)),
+                rts_calls: Arc::new(Mutex::new(Vec::new())),
+                initial_pending,
+                pending_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn rts(&self) -> bool {
+            *self.rts.lock().unwrap()
+        }
+
+        fn rts_calls(&self) -> Vec<bool> {
+            self.rts_calls.lock().unwrap().clone()
+        }
+    }
+
+    impl RtsControl for MockSerial {
+        fn set_rts(&mut self, level: bool) -> io::Result<()> {
+            *self.rts.lock().unwrap() = level;
+            self.rts_calls.lock().unwrap().push(level);
+            Ok(())
+        }
+
+        fn pending_bytes(&mut self) -> io::Result<u32> {
+            // Return `initial_pending` on the first call and 0 afterwards, so
+            // a pending byte "drains" after the first poll.
+            let call = self.pending_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if call == 0 { self.initial_pending } else { 0 })
+        }
+    }
+
+    impl AsyncRead for MockSerial {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for MockSerial {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn rts_asserted_on_write_deasserted_on_flush() {
+        let mock = MockSerial::new(0);
+        let observer = mock.clone();
+        let mut stream = RtsStream::new(mock, Some(Duration::from_millis(1)));
+
+        stream.write_all(b"abc").await.unwrap();
+        assert!(observer.rts(), "RTS should be asserted while writing");
+
+        stream.flush().await.unwrap();
+        assert!(!observer.rts(), "RTS should be deasserted after flush");
+        assert_eq!(observer.rts_calls(), vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn rts_untouched_without_delay() {
+        let mock = MockSerial::new(0);
+        let observer = mock.clone();
+        let mut stream = RtsStream::new(mock, None);
+
+        stream.write_all(b"abc").await.unwrap();
+        stream.flush().await.unwrap();
+        assert!(observer.rts_calls().is_empty(), "no RTS control without -4");
+    }
+
+    #[tokio::test]
+    async fn rts_deasserted_only_after_drain() {
+        let mock = MockSerial::new(1); // one pending byte to drain
+        let observer = mock.clone();
+        let mut stream = RtsStream::new(mock, Some(Duration::from_millis(1)));
+
+        stream.write_all(b"abc").await.unwrap();
+        stream.flush().await.unwrap();
+
+        assert!(!observer.rts(), "RTS should be deasserted after draining");
+        assert_eq!(observer.rts_calls(), vec![true, false]);
     }
 }

@@ -13,7 +13,7 @@ use tokio_modbus::prelude::{
 };
 
 use crate::datatype::{DataType, ValueOptions, encode_write_words, format_registers, parse_bits};
-use crate::transport::{AsciiClient, RtsStream, UdpClient, push_u16};
+use crate::transport::{AsciiClient, RtsSerialStream, UdpClient, push_u16};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Protocol {
@@ -390,7 +390,7 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("could not resolve host '{host}'"))
 }
 
-fn open_serial(path: &str, cfg: &Config, default_data_bits: u8) -> Result<RtsStream> {
+fn open_serial(path: &str, cfg: &Config, default_data_bits: u8) -> Result<RtsSerialStream> {
     use tokio_serial::{DataBits, FlowControl, Parity, SerialStream, StopBits};
 
     let data_bits = match cfg.data_bits.unwrap_or(default_data_bits) {
@@ -419,7 +419,7 @@ fn open_serial(path: &str, cfg: &Config, default_data_bits: u8) -> Result<RtsStr
     let rts_delay = cfg
         .rts_delay_ms
         .map(|ms| Duration::from_millis(u64::from(ms)));
-    Ok(RtsStream::new(port, rts_delay))
+    Ok(RtsSerialStream::new(port, rts_delay))
 }
 
 /// Wraps a Modbus operation with the configured timeout and flattens the
@@ -660,14 +660,19 @@ fn print_file_words(words: &[u16]) {
     }
 }
 
-async fn read_file(ctx: &mut Context, cfg: &Config) -> Result<Vec<u16>> {
-    // FC20 sub-request preceded by its byte count: reference type (1) +
-    // file number (2) + record number (2) + record length (2) = 7 bytes.
+/// Builds the FC20 (Read File Record) request PDU payload, preceded by its
+/// byte count: reference type (1) + file number (2) + record number (2) +
+/// record length (2) = 7 bytes.
+fn file_read_request(file_number: u16, record_number: u16, record_length: u16) -> Vec<u8> {
     let mut data = vec![0x07, 0x06];
-    push_u16(&mut data, cfg.file_number);
-    push_u16(&mut data, cfg.record_number());
-    push_u16(&mut data, cfg.value_count());
+    push_u16(&mut data, file_number);
+    push_u16(&mut data, record_number);
+    push_u16(&mut data, record_length);
+    data
+}
 
+async fn read_file(ctx: &mut Context, cfg: &Config) -> Result<Vec<u16>> {
+    let data = file_read_request(cfg.file_number, cfg.record_number(), cfg.value_count());
     let req = Request::Custom(0x14, std::borrow::Cow::Borrowed(&data));
     let resp = timed(cfg.timeout, ctx.call(req)).await?;
 
@@ -680,21 +685,25 @@ async fn read_file(ctx: &mut Context, cfg: &Config) -> Result<Vec<u16>> {
     }
 }
 
-async fn write_file(ctx: &mut Context, cfg: &Config) -> Result<()> {
-    let words = encode_write_words(DataType::HoldingReg16, &cfg.write_values, &cfg.value_opts)?;
-
-    // FC21 sub-request preceded by its byte count: reference type (1) +
-    // file number (2) + record number (2) + record length (2) + data (2N).
+/// Builds the FC21 (Write File Record) request PDU payload, preceded by its
+/// byte count: reference type (1) + file number (2) + record number (2) +
+/// record length (2) + record data (2N).
+fn file_write_request(file_number: u16, record_number: u16, words: &[u16]) -> Vec<u8> {
     let mut data = Vec::with_capacity(8 + 2 * words.len());
     data.push((7 + 2 * words.len()) as u8);
     data.push(0x06);
-    push_u16(&mut data, cfg.file_number);
-    push_u16(&mut data, cfg.record_number());
+    push_u16(&mut data, file_number);
+    push_u16(&mut data, record_number);
     push_u16(&mut data, words.len() as u16);
-    for word in &words {
+    for word in words {
         push_u16(&mut data, *word);
     }
+    data
+}
 
+async fn write_file(ctx: &mut Context, cfg: &Config) -> Result<()> {
+    let words = encode_write_words(DataType::HoldingReg16, &cfg.write_values, &cfg.value_opts)?;
+    let data = file_write_request(cfg.file_number, cfg.record_number(), &words);
     let req = Request::Custom(0x15, std::borrow::Cow::Borrowed(&data));
     let resp = timed(cfg.timeout, ctx.call(req)).await?;
 
@@ -730,4 +739,154 @@ fn parse_file_read_response(bytes: &[u8]) -> Result<Vec<u16>> {
         words.push(u16::from_be_bytes([data[i], data[i + 1]]));
     }
     Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(target: &str) -> Cli {
+        Cli {
+            target: target.to_string(),
+            write_values: vec![],
+            protocol: None,
+            slave: 1,
+            start_ref: 1,
+            count: None,
+            data_type: "4".to_string(),
+            file_number: 4,
+            unsigned: false,
+            big_int: false,
+            big_float: false,
+            zero_based: false,
+            poll_once: false,
+            poll_rate_ms: 1000,
+            timeout: 1.0,
+            port_parity: None,
+            baud: 19200,
+            data_bits: None,
+            stop_bits: 1,
+            rts_delay_ms: None,
+        }
+    }
+
+    #[test]
+    fn detect_protocol_defaults() {
+        assert_eq!(detect_protocol("COM1"), Protocol::Rtu);
+        assert_eq!(detect_protocol(r"\\.\COM5"), Protocol::Rtu);
+        assert_eq!(detect_protocol("/dev/ttyUSB0"), Protocol::Rtu);
+        assert_eq!(detect_protocol("192.168.1.10"), Protocol::Tcp);
+        assert_eq!(detect_protocol("localhost"), Protocol::Tcp);
+    }
+
+    #[test]
+    fn valid_default_config() {
+        let cfg = Config::build(cli("192.168.1.10")).unwrap();
+        assert_eq!(cfg.protocol, Protocol::Tcp);
+        assert_eq!(cfg.slave, 1);
+        assert_eq!(cfg.data_type, DataType::HoldingReg16);
+        assert_eq!(cfg.pdu_addr(), 0);
+        assert_eq!(cfg.port, 502);
+    }
+
+    #[test]
+    fn invalid_parity_rejected() {
+        let mut c = cli("COM1");
+        c.protocol = Some(Protocol::Rtu);
+        c.port_parity = Some("foo".to_string());
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn invalid_slave_for_serial_rejected() {
+        let mut c = cli("COM1");
+        c.protocol = Some(Protocol::Rtu);
+        c.slave = 0;
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn invalid_start_ref_rejected() {
+        let mut c = cli("192.168.1.10");
+        c.start_ref = 0; // requires -0
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn zero_based_start_ref() {
+        let mut c = cli("192.168.1.10");
+        c.start_ref = 0;
+        c.zero_based = true;
+        let cfg = Config::build(c).unwrap();
+        assert_eq!(cfg.pdu_addr(), 0);
+    }
+
+    #[test]
+    fn invalid_count_rejected() {
+        let mut c = cli("192.168.1.10");
+        c.count = Some(126);
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn register_limit_enforced() {
+        let mut c = cli("192.168.1.10");
+        c.data_type = "4:i64".to_string();
+        c.count = Some(32); // 32 * 4 = 128 registers > 125
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn invalid_timeout_rejected() {
+        let mut c = cli("192.168.1.10");
+        c.timeout = 11.0;
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn rtu_requires_8_data_bits() {
+        let mut c = cli("COM1");
+        c.protocol = Some(Protocol::Rtu);
+        c.data_bits = Some(7);
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn rs485_only_for_serial() {
+        let mut c = cli("192.168.1.10");
+        c.rts_delay_ms = Some(10);
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn readonly_type_rejects_write() {
+        let mut c = cli("192.168.1.10");
+        c.data_type = "3".to_string();
+        c.write_values = vec!["1".to_string()];
+        assert!(Config::build(c).is_err());
+    }
+
+    #[test]
+    fn file_read_request_encoding() {
+        assert_eq!(
+            file_read_request(4, 0, 2),
+            vec![0x07, 0x06, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02]
+        );
+    }
+
+    #[test]
+    fn file_write_request_encoding() {
+        assert_eq!(
+            file_write_request(4, 0, &[100, 200]),
+            vec![
+                0x0B, 0x06, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x64, 0x00, 0xC8
+            ]
+        );
+    }
+
+    #[test]
+    fn file_read_response_parsing() {
+        let words = parse_file_read_response(&[0x06, 0x05, 0x06, 0x00, 0x64, 0x00, 0xC8]).unwrap();
+        assert_eq!(words, vec![100, 200]);
+    }
 }
