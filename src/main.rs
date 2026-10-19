@@ -1037,13 +1037,32 @@ mod tests {
                     return None;
                 }
                 let qty = u16::from_be_bytes([pdu[3], pdu[4]]) as usize;
-                let byte_count = (qty + 7) / 8;
+                let byte_count = qty.div_ceil(8);
                 let mut r = vec![func, byte_count as u8];
-                r.extend(std::iter::repeat(0u8).take(byte_count));
+                r.extend(std::iter::repeat_n(0u8, byte_count));
                 Some(r)
             }
             0x05 => Some(vec![0x05, pdu[1], pdu[2], pdu[3], pdu[4]]),
             0x0F => Some(vec![0x0F, pdu[1], pdu[2], pdu[3], pdu[4]]),
+            0x2B => {
+                // FC43 read device identification: [0x2B, 0x0E, read_code, object_id].
+                // Respond with one object: vendor name (id 0) = "ACME".
+                Some(vec![
+                    0x2B, 0x0E, 0x03, 0x03, 0x00, 0x00, 0x01, 0x00, 0x04, b'A', b'C', b'M', b'E',
+                ])
+            }
+            0x14 => {
+                // FC20 read file record. Return two fixed words [0x1234, 0x5678].
+                Some(vec![0x14, 0x06, 0x05, 0x06, 0x12, 0x34, 0x56, 0x78])
+            }
+            0x15 => {
+                // FC21 write file record: echo the request header.
+                let mut resp = vec![0x15];
+                if pdu.len() >= 8 {
+                    resp.extend_from_slice(&pdu[1..8]);
+                }
+                Some(resp)
+            }
             _ => Some(vec![func | 0x80, 0x01]), // illegal function
         }
     }
@@ -1158,10 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn timed_maps_transport_error() {
         let result: Result<u16> = timed(Duration::from_secs(1), async {
-            Err(tokio_modbus::Error::Transport(io::Error::new(
-                io::ErrorKind::Other,
-                "boom",
-            )))
+            Err(tokio_modbus::Error::Transport(io::Error::other("boom")))
         })
         .await;
         assert!(result.is_err());
@@ -1406,6 +1422,66 @@ mod tests {
         c.data_type = "0".to_string();
         c.write_values = vec!["1".to_string()];
         c.count = Some(1); // force FC5
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_write(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn do_read_device_id() {
+        let (addr, _store) = spawn_server(vec![0]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "id".to_string();
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_read(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_words() {
+        let (addr, _store) = spawn_server(vec![0]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "file".to_string();
+        c.count = Some(2);
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        let words = read_file(&mut ctx, &cfg).await.unwrap();
+        assert_eq!(words, vec![0x1234, 0x5678]);
+    }
+
+    #[tokio::test]
+    async fn write_file_succeeds() {
+        let (addr, _store) = spawn_server(vec![0]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "file".to_string();
+        c.write_values = vec!["100".to_string(), "200".to_string()];
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        write_file(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn do_read_file() {
+        let (addr, _store) = spawn_server(vec![0]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "file".to_string();
+        c.count = Some(2);
+        let cfg = Config::build(c).unwrap();
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_read(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn do_write_file() {
+        let (addr, _store) = spawn_server(vec![0]).await;
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.data_type = "file".to_string();
+        c.write_values = vec!["100".to_string(), "200".to_string()];
         let cfg = Config::build(c).unwrap();
         let mut ctx = connect(&cfg).await.unwrap();
         do_write(&mut ctx, &cfg).await.unwrap();
