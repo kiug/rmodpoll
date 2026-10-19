@@ -889,4 +889,245 @@ mod tests {
         let words = parse_file_read_response(&[0x06, 0x05, 0x06, 0x00, 0x64, 0x00, 0xC8]).unwrap();
         assert_eq!(words, vec![100, 200]);
     }
+
+    // ------------------------------------------------------------------
+    // Integration tests with an in-process Modbus TCP server
+    // ------------------------------------------------------------------
+
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct Store(Arc<Mutex<Vec<u16>>>);
+
+    impl Store {
+        fn get(&self, addr: usize) -> u16 {
+            self.0.lock().unwrap().get(addr).copied().unwrap_or(0)
+        }
+
+        fn set(&self, addr: usize, value: u16) {
+            let mut regs = self.0.lock().unwrap();
+            if regs.len() <= addr {
+                regs.resize(addr + 1, 0);
+            }
+            regs[addr] = value;
+        }
+    }
+
+    /// Starts a Modbus TCP server serving the given initial registers and
+    /// returns its bound address together with the shared register store.
+    async fn spawn_server(initial: Vec<u16>) -> (SocketAddr, Store) {
+        let store = Store(Arc::new(Mutex::new(initial)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+                let store = server_store.clone();
+                tokio::spawn(async move {
+                    let _ = serve_connection(socket, &store).await;
+                });
+            }
+        });
+
+        (addr, store)
+    }
+
+    /// Starts a server that accepts connections but never responds.
+    async fn spawn_silent_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (_socket, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+                tokio::spawn(std::future::pending::<()>());
+            }
+        });
+        addr
+    }
+
+    async fn serve_connection(mut socket: tokio::net::TcpStream, store: &Store) -> io::Result<()> {
+        loop {
+            let mut header = [0u8; 7];
+            if socket.read_exact(&mut header).await.is_err() {
+                return Ok(()); // client closed the connection
+            }
+            let txn = [header[0], header[1]];
+            let unit = header[6];
+            let len = u16::from_be_bytes([header[4], header[5]]) as usize;
+            if len == 0 {
+                continue;
+            }
+            let mut pdu = vec![0u8; len - 1];
+            if socket.read_exact(&mut pdu).await.is_err() {
+                return Ok(());
+            }
+
+            let Some(resp) = build_response(&pdu, store) else {
+                return Ok(());
+            };
+
+            let mut out = Vec::with_capacity(7 + resp.len());
+            out.extend_from_slice(&txn);
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&((resp.len() + 1) as u16).to_be_bytes());
+            out.push(unit);
+            out.extend_from_slice(&resp);
+            if socket.write_all(&out).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn build_response(pdu: &[u8], store: &Store) -> Option<Vec<u8>> {
+        let func = *pdu.first()?;
+        match func {
+            0x03 | 0x04 => {
+                if pdu.len() < 5 {
+                    return None;
+                }
+                let addr = u16::from_be_bytes([pdu[1], pdu[2]]) as usize;
+                let qty = u16::from_be_bytes([pdu[3], pdu[4]]) as usize;
+                let mut r = vec![func, (qty * 2) as u8];
+                for i in 0..qty {
+                    let v = store.get(addr + i);
+                    r.push((v >> 8) as u8);
+                    r.push(v as u8);
+                }
+                Some(r)
+            }
+            0x06 => {
+                if pdu.len() < 5 {
+                    return None;
+                }
+                let addr = u16::from_be_bytes([pdu[1], pdu[2]]) as usize;
+                let value = u16::from_be_bytes([pdu[3], pdu[4]]);
+                store.set(addr, value);
+                Some(vec![0x06, pdu[1], pdu[2], pdu[3], pdu[4]])
+            }
+            0x10 => {
+                if pdu.len() < 6 {
+                    return None;
+                }
+                let addr = u16::from_be_bytes([pdu[1], pdu[2]]) as usize;
+                let qty = u16::from_be_bytes([pdu[3], pdu[4]]) as usize;
+                for i in 0..qty {
+                    let value = u16::from_be_bytes([pdu[6 + 2 * i], pdu[7 + 2 * i]]);
+                    store.set(addr + i, value);
+                }
+                Some(vec![0x10, pdu[1], pdu[2], pdu[3], pdu[4]])
+            }
+            0x01 | 0x02 => {
+                if pdu.len() < 5 {
+                    return None;
+                }
+                let qty = u16::from_be_bytes([pdu[3], pdu[4]]) as usize;
+                let byte_count = (qty + 7) / 8;
+                let mut r = vec![func, byte_count as u8];
+                r.extend(std::iter::repeat(0u8).take(byte_count));
+                Some(r)
+            }
+            0x05 => Some(vec![0x05, pdu[1], pdu[2], pdu[3], pdu[4]]),
+            0x0F => Some(vec![0x0F, pdu[1], pdu[2], pdu[3], pdu[4]]),
+            _ => Some(vec![func | 0x80, 0x01]), // illegal function
+        }
+    }
+
+    #[tokio::test]
+    async fn read_holding_registers_end_to_end() {
+        let (addr, _store) = spawn_server(vec![0x1234, 0x5678, 0xABCD]).await;
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.count = Some(3);
+        let cfg = Config::build(c).unwrap();
+
+        let mut ctx = connect(&cfg).await.unwrap();
+        let words = ctx.read_holding_registers(0, 3).await.unwrap().unwrap();
+        assert_eq!(words, vec![0x1234, 0x5678, 0xABCD]);
+    }
+
+    #[tokio::test]
+    async fn write_single_register_end_to_end() {
+        let (addr, store) = spawn_server(vec![0, 0, 0]).await;
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.write_values = vec!["100".to_string()];
+        c.count = Some(1); // force FC6
+        let cfg = Config::build(c).unwrap();
+
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_write(&mut ctx, &cfg).await.unwrap();
+
+        assert_eq!(store.get(0), 100);
+    }
+
+    #[tokio::test]
+    async fn write_multiple_registers_end_to_end() {
+        let (addr, store) = spawn_server(vec![0, 0, 0]).await;
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.write_values = vec!["100".to_string(), "200".to_string()];
+        let cfg = Config::build(c).unwrap();
+
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_write(&mut ctx, &cfg).await.unwrap();
+
+        assert_eq!(store.get(0), 100);
+        assert_eq!(store.get(1), 200);
+    }
+
+    #[tokio::test]
+    async fn do_read_exercises_full_path() {
+        let (addr, _store) = spawn_server(vec![0x1234, 0x5678]).await;
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.count = Some(2);
+        let cfg = Config::build(c).unwrap();
+
+        let mut ctx = connect(&cfg).await.unwrap();
+        do_read(&mut ctx, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_polls_once() {
+        let (addr, _store) = spawn_server(vec![1, 2]).await;
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.count = Some(2);
+        c.poll_once = true;
+        let cfg = Config::build(c).unwrap();
+
+        run(&cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_times_out() {
+        let addr = spawn_silent_server().await;
+
+        let mut c = cli("127.0.0.1");
+        c.port_parity = Some(addr.port().to_string());
+        c.timeout = 0.1;
+        c.count = Some(1);
+        let cfg = Config::build(c).unwrap();
+
+        let mut ctx = connect(&cfg).await.unwrap();
+        let result = do_read(&mut ctx, &cfg).await;
+        assert!(result.is_err(), "read should time out");
+    }
 }
