@@ -30,7 +30,7 @@ pub(crate) fn push_u16(buf: &mut Vec<u8>, value: u16) {
 }
 
 fn protocol_err(msg: impl Into<String>) -> Error {
-    Error::Transport(io::Error::new(io::ErrorKind::Other, msg.into()))
+    Error::Transport(io::Error::other(msg.into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ fn encode_request_pdu(req: &Request<'_>) -> Result<Vec<u8>, String> {
         }
         Request::WriteMultipleCoils(addr, coils) => {
             let count = coils.len();
-            let byte_count = (count + 7) / 8;
+            let byte_count = count.div_ceil(8);
             p.push(0x0F);
             push_u16(&mut p, *addr);
             push_u16(&mut p, count as u16);
@@ -415,10 +415,10 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.delay.is_some() {
-            if let Err(e) = this.inner.set_rts(true) {
-                return Poll::Ready(Err(e));
-            }
+        if this.delay.is_some()
+            && let Err(e) = this.inner.set_rts(true)
+        {
+            return Poll::Ready(Err(e));
         }
         Pin::new(&mut this.inner).poll_write(cx, buf)
     }
@@ -596,7 +596,7 @@ fn parse_ascii_frame(frame: &[u8]) -> Result<Vec<u8>, String> {
     while hex.last() == Some(&b'\r') || hex.last() == Some(&b'\n') {
         hex = &hex[..hex.len() - 1];
     }
-    if hex.is_empty() || hex.len() % 2 != 0 {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
         return Err("malformed ASCII frame".into());
     }
 

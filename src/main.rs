@@ -200,10 +200,10 @@ impl Config {
             bail!("start reference must be 1-65536");
         }
 
-        if let Some(c) = cli.count {
-            if !(1..=125).contains(&c) {
-                bail!("count must be 1-125");
-            }
+        if let Some(c) = cli.count
+            && !(1..=125).contains(&c)
+        {
+            bail!("count must be 1-125");
         }
 
         if data_type.is_register() {
@@ -488,10 +488,8 @@ async fn run_read(cfg: &Config) -> Result<()> {
                 // A failed transaction may have left a network connection in a
                 // broken state, so drop it and reconnect on the next cycle. A
                 // serial port stays open (a timeout does not close it).
-                if !is_serial {
-                    if let Some(connection) = ctx.take() {
-                        disconnect(connection).await;
-                    }
+                if !is_serial && let Some(connection) = ctx.take() {
+                    disconnect(connection).await;
                 }
             }
         }

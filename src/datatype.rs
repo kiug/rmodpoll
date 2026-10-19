@@ -151,21 +151,11 @@ impl DataType {
 }
 
 /// Flags controlling how multi-register values are interpreted.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ValueOptions {
     pub unsigned: bool,
     pub big_endian_int: bool,
     pub big_endian_float: bool,
-}
-
-impl Default for ValueOptions {
-    fn default() -> Self {
-        Self {
-            unsigned: false,
-            big_endian_int: false,
-            big_endian_float: false,
-        }
-    }
 }
 
 /// Format a list of raw registers according to a data type.
@@ -174,7 +164,7 @@ pub fn format_registers(words: &[u16], dt: DataType, opts: &ValueOptions) -> Res
     if wpv == 0 {
         bail!("data type {dt:?} is not register-based");
     }
-    if words.len() % wpv != 0 {
+    if !words.len().is_multiple_of(wpv) {
         bail!(
             "received {} registers, not a multiple of {wpv}",
             words.len()
