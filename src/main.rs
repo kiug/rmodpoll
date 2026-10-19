@@ -40,8 +40,14 @@ enum ParityArg {
 #[derive(Parser)]
 #[command(
     name = "rmodpoll",
-    version,
-    about = "Modbus master poller for testing device communication"
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_HASH"), ")"),
+    about = concat!(
+        "rmodpoll ",
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("GIT_COMMIT_HASH"),
+        ") - Modbus master poller for testing device communication"
+    )
 )]
 struct Cli {
     /// Serial port (Modbus ASCII/RTU) or host name / dotted IP address (TCP/UDP/enc)
@@ -318,7 +324,8 @@ async fn main() -> Result<()> {
 
 fn print_header(cfg: &Config) {
     let version = env!("CARGO_PKG_VERSION");
-    println!("rmodpoll {version} - Modbus master poller");
+    let hash = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+    println!("rmodpoll {version} ({hash}) - Modbus master poller");
     println!("Protocol: {}", protocol_name(cfg.protocol));
 
     let target = match cfg.protocol {
