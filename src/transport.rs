@@ -773,6 +773,62 @@ mod tests {
     }
 
     #[test]
+    fn encode_unsupported_request_rejected() {
+        assert!(encode_request_pdu(&Request::ReportServerId).is_err());
+        assert!(encode_request_pdu(&Request::MaskWriteRegister(0, 0, 0)).is_err());
+        assert!(
+            encode_request_pdu(&Request::ReadWriteMultipleRegisters(
+                0,
+                1,
+                0,
+                Cow::Borrowed(&[0x0001][..])
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_response_error_paths() {
+        // FC1/2: missing byte count
+        assert!(decode_response_pdu(0x01, &[]).is_err());
+        // FC1/2: byte count exceeds available data
+        assert!(decode_response_pdu(0x01, &[0x05, 0x01]).is_err());
+        // FC3/4: missing byte count
+        assert!(decode_response_pdu(0x03, &[]).is_err());
+        // FC3/4: byte count exceeds available data
+        assert!(decode_response_pdu(0x03, &[0x04, 0x00, 0x0A]).is_err());
+        // FC5/6/15/16: truncated address/value
+        assert!(decode_response_pdu(0x05, &[0x00]).is_err());
+        assert!(decode_response_pdu(0x06, &[]).is_err());
+        assert!(decode_response_pdu(0x10, &[0x00, 0x01, 0x00]).is_err());
+    }
+
+    #[test]
+    fn device_id_decode_error_paths() {
+        // Unexpected MEI type
+        assert!(decode_device_id(&[0x00]).is_err());
+        // Missing read code
+        assert!(decode_device_id(&[0x0E]).is_err());
+        // Invalid read code
+        assert!(decode_device_id(&[0x0E, 0xFF, 0x01, 0x00, 0x00, 0x00]).is_err());
+        // Invalid conformity level
+        assert!(decode_device_id(&[0x0E, 0x01, 0xFF, 0x00, 0x00, 0x00]).is_err());
+        // Missing object count
+        assert!(decode_device_id(&[0x0E, 0x01, 0x01, 0x00, 0x00]).is_err());
+        // Short object id
+        assert!(decode_device_id(&[0x0E, 0x01, 0x01, 0x00, 0x00, 0x01]).is_err());
+        // Short object length
+        assert!(decode_device_id(&[0x0E, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00]).is_err());
+        // Short object value
+        assert!(decode_device_id(&[0x0E, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x03, 0x41]).is_err());
+        // more_follows == 0xFF
+        match decode_device_id(&[0x0E, 0x01, 0x01, 0xFF, 0x00, 0x00]).unwrap() {
+            Response::ReadDeviceIdentification(r) => assert!(r.more_follows),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn ascii_frame_round_trip() {
         let adu = vec![0x01u8, 0x03, 0x00, 0x00, 0x00, 0x01];
         let checksum = lrc(&adu);
@@ -804,6 +860,9 @@ mod tests {
         rts_calls: Arc<Mutex<Vec<bool>>>,
         initial_pending: u32,
         pending_calls: Arc<AtomicUsize>,
+        fail_rts: bool,
+        fail_pending: bool,
+        fail_flush: bool,
     }
 
     impl MockSerial {
@@ -813,7 +872,25 @@ mod tests {
                 rts_calls: Arc::new(Mutex::new(Vec::new())),
                 initial_pending,
                 pending_calls: Arc::new(AtomicUsize::new(0)),
+                fail_rts: false,
+                fail_pending: false,
+                fail_flush: false,
             }
+        }
+
+        fn fail_rts(mut self) -> Self {
+            self.fail_rts = true;
+            self
+        }
+
+        fn fail_pending(mut self) -> Self {
+            self.fail_pending = true;
+            self
+        }
+
+        fn fail_flush(mut self) -> Self {
+            self.fail_flush = true;
+            self
         }
 
         fn rts(&self) -> bool {
@@ -827,12 +904,18 @@ mod tests {
 
     impl RtsControl for MockSerial {
         fn set_rts(&mut self, level: bool) -> io::Result<()> {
+            if self.fail_rts {
+                return Err(io::Error::other("rts failed"));
+            }
             *self.rts.lock().unwrap() = level;
             self.rts_calls.lock().unwrap().push(level);
             Ok(())
         }
 
         fn pending_bytes(&mut self) -> io::Result<u32> {
+            if self.fail_pending {
+                return Err(io::Error::other("pending failed"));
+            }
             // Return `initial_pending` on the first call and 0 afterwards, so
             // a pending byte "drains" after the first poll.
             let call = self.pending_calls.fetch_add(1, Ordering::SeqCst);
@@ -860,6 +943,9 @@ mod tests {
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_flush {
+                return Poll::Ready(Err(io::Error::other("flush failed")));
+            }
             Poll::Ready(Ok(()))
         }
 
@@ -904,6 +990,59 @@ mod tests {
 
         assert!(!observer.rts(), "RTS should be deasserted after draining");
         assert_eq!(observer.rts_calls(), vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn rts_flush_propagates_inner_error() {
+        let mock = MockSerial::new(0).fail_flush();
+        let mut stream = RtsStream::new(mock, Some(Duration::from_millis(1)));
+
+        stream.write_all(b"abc").await.unwrap();
+        assert!(stream.flush().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rts_drain_falls_back_on_pending_error() {
+        let mock = MockSerial::new(0).fail_pending();
+        let observer = mock.clone();
+        let mut stream = RtsStream::new(mock, Some(Duration::from_millis(1)));
+
+        stream.write_all(b"abc").await.unwrap();
+        stream.flush().await.unwrap();
+
+        assert!(
+            !observer.rts(),
+            "RTS should be deasserted after the fallback delay"
+        );
+        assert_eq!(observer.rts_calls(), vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn rts_write_propagates_rts_error() {
+        let mock = MockSerial::new(0).fail_rts();
+        let mut stream = RtsStream::new(mock, Some(Duration::from_millis(1)));
+
+        assert!(stream.write_all(b"abc").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rts_shutdown_deasserts_and_shuts_down() {
+        let mock = MockSerial::new(0);
+        let observer = mock.clone();
+        let mut stream = RtsStream::new(mock, Some(Duration::from_millis(1)));
+
+        stream.shutdown().await.unwrap();
+        assert!(!observer.rts(), "shutdown should deassert RTS");
+    }
+
+    #[tokio::test]
+    async fn rts_shutdown_without_delay() {
+        let mock = MockSerial::new(0);
+        let observer = mock.clone();
+        let mut stream = RtsStream::new(mock, None);
+
+        stream.shutdown().await.unwrap();
+        assert!(observer.rts_calls().is_empty(), "no RTS control without -4");
     }
 
     // ------------------------------------------------------------------
@@ -1052,5 +1191,83 @@ mod tests {
         assert_eq!(resp, Response::ReadHoldingRegisters(vec![0x1234]));
 
         assert_eq!(observer.written(), b":010300000001FB\r\n".to_vec());
+    }
+
+    #[tokio::test]
+    async fn udp_client_rejects_short_response() {
+        let response = vec![0x00, 0x01, 0x00, 0x00]; // fewer than 8 bytes
+        let mock = MockUdp::new(vec![response]);
+        let mut client = UdpClient::new(mock, Slave::from(1));
+
+        assert!(
+            client
+                .call(Request::ReadHoldingRegisters(0, 1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ascii_client_closed_port() {
+        // An empty response stream makes the first read return 0 (EOF).
+        let mock = MockIo::new(vec![]);
+        let mut client = AsciiClient::new(mock, Slave::from(1));
+
+        assert!(
+            client
+                .call(Request::ReadHoldingRegisters(0, 1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ascii_client_short_response() {
+        let mock = MockIo::new(b":01\r\n".to_vec());
+        let mut client = AsciiClient::new(mock, Slave::from(1));
+
+        assert!(
+            client
+                .call(Request::ReadHoldingRegisters(0, 1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ascii_client_lrc_mismatch() {
+        let mock = MockIo::new(b":0103021234FF\r\n".to_vec());
+        let mut client = AsciiClient::new(mock, Slave::from(1));
+
+        assert!(
+            client
+                .call(Request::ReadHoldingRegisters(0, 1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ascii_client_slave_mismatch() {
+        // Valid LRC (0xB3) for slave 2, but the client expects slave 1.
+        let mock = MockIo::new(b":0203021234B3\r\n".to_vec());
+        let mut client = AsciiClient::new(mock, Slave::from(1));
+
+        assert!(
+            client
+                .call(Request::ReadHoldingRegisters(0, 1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ascii_client_exception_response() {
+        // Slave 1, FC3 | 0x80 = 0x83, exception code 1 (illegal function).
+        let mock = MockIo::new(b":0183017B\r\n".to_vec());
+        let mut client = AsciiClient::new(mock, Slave::from(1));
+
+        let result = client.call(Request::ReadHoldingRegisters(0, 1)).await;
+        assert!(result.unwrap().is_err());
     }
 }

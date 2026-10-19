@@ -1362,6 +1362,18 @@ mod tests {
         print_device_id(&resp);
     }
 
+    #[test]
+    fn print_header_covers_network_and_serial() {
+        let cfg = Config::build(cli("192.168.1.10")).unwrap();
+        print_header(&cfg);
+
+        let mut c = cli("COM1");
+        c.protocol = Some(Protocol::Rtu);
+        c.rts_delay_ms = Some(10);
+        let cfg = Config::build(c).unwrap();
+        print_header(&cfg);
+    }
+
     // ------------------------------------------------------------------
     // Additional in-process integration coverage
     // ------------------------------------------------------------------
